@@ -5,7 +5,8 @@
  * Behaviour
  *   - Press UP (PF7) to start, CENTER (PF8) to stop at any time.
  *   - Follows the black line on the white cardboard with a PD
- *     controller fed by the five analog IR sensor readings.
+ *     controller fed by the five analog IR sensor readings, plus a
+ *     pivot behaviour for sharp (90 degree or tighter) corners.
  *   - Passes through the first crossing and stops on the second one.
  *   - Mirrors each IR sensor onto the front LEDs exactly as in the
  *     IR sensor demo (IR1->LED1, IR2->LED2, IR3->LED4+LED5,
@@ -46,28 +47,49 @@
 #define PULSE_MAX_US    1720U  /* us, full speed counter-clockwise */
 
 /* ---------------- line follower tuning ----------------
- * Base speed is the pulse offset away from PULSE_STOP.  The PD
- * output adds "turn" to both servos: because the left servo speeds
- * up above 1500 us and the right servo speeds up below 1500 us,
- * a positive turn steers right and a negative turn steers left.
- * Gains are fixed point: turn_us = (KP * error_x100 + KD * d(error)_x100)/100
- * error_x100 is the sensor position in hundredths (-200 .. +200).
+ * error_x100 is the line position in hundredths (-200 .. +200).
+ * Both wheel speeds are kept >= 0 (forward only).  Because the IR
+ * sensors sit on the wheel axis there is no look-ahead, so the gains
+ * must be gentle: an aggressive turn rotates the sensors across the
+ * line before the correction can settle, causing overshoot/weaving.
+ * All gains are fixed point: value = (gain * error_x100) / 100.
  */
-#define BASE_SPEED      40    /* us offset from stop for normal forward drive */
-#define KP              7*15     /* proportional gain */
-#define KD              35*100     /* derivative gain */
-#define MAX_TURN        55    /* us, clamp on the PD correction */
-#define CONTROL_MS      5U    /* 10 ms control loop (100 Hz) */
+#define BASE_SPEED      45     /* us offset from stop when on line centre */
+#define SPEED_DROP      25     /* us of speed removed at full error */
+#define MIN_SPEED       25     /* us, keep enough speed to turn with */
+#define KP              35     /* proportional gain */
+#define KD              40     /* derivative gain (damping) */
+#define KI              1      /* integral gain (small bias correction only) */
+#define MAX_TURN        50     /* us, maximum differential between wheels */
+#define TURN_SLEW       3      /* us, maximum change of turn per 5 ms tick */
+#define MAX_INTEGRAL    800    /* anti-windup clamp on the integral */
+#define INTEGRAL_LIMIT  30     /* only integrate when |error| < 0.30 spacing */
+#define CONTROL_MS      10U     /* 5 ms control loop (200 Hz) */
+
+/* ---------------- sharp corner handling ----------------
+ * A 90 degree (or tighter) corner leaves the line at the edge of the
+ * sensor array for a sustained time.  The robot then performs a
+ * gentle powered turn: the outer wheel drives faster while the inner
+ * wheel slows but keeps moving, so the robot arcs around the corner
+ * without spinning or overshooting the new path.
+ */
+#define SHARP_ERROR     180    /* |error_x100| that counts as a hard corner */
+#define SHARP_MS        150    /* how long it must persist */
+#define RECOVER_ERROR   70     /* |error_x100| at which the turn ends */
+#define CORNER_SPEED    22     /* us, forward speed during a corner turn */
+#define CORNER_TURN     28     /* us, differential during a corner turn */
+#define TURN_MIN_MS     120U   /* minimum turn time (ignore brief dropouts) */
+#define TURN_TIMEOUT    900U   /* ms, give up a turn after this long */
 
 /* ---------------- IR thresholds ----------------
  * Black reads higher than white.  Calibrate these for the room
  * lighting (see the IR sensor demo handout), then tune KP/KD.
  */
-#define THRESH_IR1      1500
-#define THRESH_IR2      1500
-#define THRESH_IR3      1500
-#define THRESH_IR4      1500
-#define THRESH_IR5      1500
+#define THRESH_IR1      1192
+#define THRESH_IR2      1358
+#define THRESH_IR3      1374
+#define THRESH_IR4      1052
+#define THRESH_IR5      1466
 
 /* ---------------- crossing detector ----------------
  * A perpendicular (solid black) line is identified by BOTH outer
@@ -100,7 +122,12 @@ static volatile run_state_t run_state = STATE_IDLE;
 
 static int32_t  error_x100 = 0;      /* line position error */
 static int32_t  prev_error_x100 = 0;
+static int32_t  integral = 0;        /* bounded integral (bias correction) */
 static int32_t  last_turn = 0;       /* for the display */
+static uint8_t  turn_active = 0U;
+static uint8_t  sharp_timer_on = 0U;
+static uint32_t sharp_since_ms = 0U;
+static uint32_t turn_start_ms = 0U;
 static uint16_t left_pulse = PULSE_STOP;
 static uint16_t right_pulse = PULSE_STOP;
 
@@ -120,6 +147,7 @@ static void buttons_init(void);
 static void motors_stop(void);
 static void handle_buttons(void);
 static int32_t compute_line_error(void);
+static void update_corner_turn(uint32_t abs_error);
 static void control_cycle(void);
 static void display_update(void);
 
@@ -284,6 +312,9 @@ static void handle_buttons(void)
         if (run_state != STATE_RUNNING) {
             error_x100 = 0;
             prev_error_x100 = 0;
+            integral = 0;
+            turn_active = 0U;
+            sharp_timer_on = 0U;
             last_turn = 0;
             crossing_count = 0U;
             crossing_seen = 0U;
@@ -385,6 +416,38 @@ static void check_crossing(void)
     }
 }
 
+/* Detect a sustained large error (hard corner) and run a powered turn
+ * until the line is centred again.  Both wheels keep driving forward
+ * so the sensor array moves onto the next segment of the line. */
+static void update_corner_turn(uint32_t abs_error)
+{
+    if (!turn_active) {
+        if (abs_error >= SHARP_ERROR) {
+            if (!sharp_timer_on) {
+                sharp_since_ms = ms_count;
+                sharp_timer_on = 1U;
+            } else if ((uint32_t)(ms_count - sharp_since_ms) >= SHARP_MS) {
+                turn_active = 1U;
+                turn_start_ms = ms_count;
+                sharp_timer_on = 0U;
+                integral = 0;
+            }
+        } else {
+            sharp_timer_on = 0U;
+        }
+    } else {
+        uint32_t elapsed = (uint32_t)(ms_count - turn_start_ms);
+        if ((elapsed >= TURN_MIN_MS) &&
+            ((line_seen && (abs_error <= RECOVER_ERROR)) ||
+             (elapsed >= TURN_TIMEOUT))) {
+            turn_active = 0U;
+            sharp_timer_on = 0U;
+            prev_error_x100 = error_x100;
+            integral = 0;
+        }
+    }
+}
+
 static void control_cycle(void)
 {
     Read_ADC3_Channels();
@@ -407,32 +470,65 @@ static void control_cycle(void)
     }
 
     {
-        int32_t derivative = error_x100 - prev_error_x100;
-        int32_t turn = (KP * error_x100 + KD * derivative) / 100;
+        uint32_t abs_error = (error_x100 < 0) ?
+                             (uint32_t)-error_x100 : (uint32_t)error_x100;
+        int32_t derivative;
+        int32_t turn;
+        int32_t speed;
+
+        update_corner_turn(abs_error);
+
+        /* The integral is only for small, persistent errors (e.g. one
+         * motor is slower).  It is frozen and bled off during corners
+         * so it cannot wind up and overshoot on corner exit. */
+        if (!turn_active) {
+            if (abs_error <= INTEGRAL_LIMIT) {
+                integral += error_x100;
+                if (integral > MAX_INTEGRAL) {
+                    integral = MAX_INTEGRAL;
+                } else if (integral < -MAX_INTEGRAL) {
+                    integral = -MAX_INTEGRAL;
+                }
+            } else {
+                integral /= 2;
+            }
+        }
+
+        if (turn_active) {
+            turn = (error_x100 >= 0) ? CORNER_TURN : -CORNER_TURN;
+            speed = CORNER_SPEED;
+        } else {
+            derivative = error_x100 - prev_error_x100;
+            turn = (KP * error_x100 + KD * derivative + KI * integral) / 100;
+            if (turn > MAX_TURN) {
+                turn = MAX_TURN;
+            } else if (turn < -MAX_TURN) {
+                turn = -MAX_TURN;
+            }
+            speed = BASE_SPEED - (SPEED_DROP * (int32_t)abs_error) / 100;
+            if (speed < MIN_SPEED) {
+                speed = MIN_SPEED;
+            }
+        }
 
         prev_error_x100 = error_x100;
-        if (turn > MAX_TURN) {
-            turn = MAX_TURN;
-        } else if (turn < -MAX_TURN) {
-            turn = -MAX_TURN;
-        }
         last_turn = turn;
-    }
 
-    /* left forward = pulse above 1500, right forward = pulse below 1500 */
-    {
-        int32_t l = (int32_t)PULSE_STOP + BASE_SPEED + last_turn;
-        int32_t r = (int32_t)PULSE_STOP - BASE_SPEED + last_turn;
+        /* left forward = pulse above 1500, right forward = below 1500 */
+        {
+            int32_t l = (int32_t)PULSE_STOP + speed + turn;
+            int32_t r = (int32_t)PULSE_STOP - speed + turn;
 
-        if (l < (int32_t)PULSE_MIN_US) l = (int32_t)PULSE_MIN_US;
-        if (l > (int32_t)PULSE_MAX_US) l = (int32_t)PULSE_MAX_US;
-        if (r < (int32_t)PULSE_MIN_US) r = (int32_t)PULSE_MIN_US;
-        if (r > (int32_t)PULSE_MAX_US) r = (int32_t)PULSE_MAX_US;
+            if (l < (int32_t)PULSE_MIN_US) l = (int32_t)PULSE_MIN_US;
+            if (l > (int32_t)PULSE_MAX_US) l = (int32_t)PULSE_MAX_US;
+            if (r < (int32_t)PULSE_MIN_US) r = (int32_t)PULSE_MIN_US;
+            if (r > (int32_t)PULSE_MAX_US) r = (int32_t)PULSE_MAX_US;
 
-        left_pulse = (uint16_t)l;
-        right_pulse = (uint16_t)r;
-        TIM4->CCR1 = left_pulse;
-        TIM4->CCR3 = right_pulse;
+            left_pulse = (uint16_t)l;
+            right_pulse = (uint16_t)r;
+            TIM4->CCR1 = left_pulse;
+            TIM4->CCR3 = right_pulse;
+        }
     }
 
     check_crossing();
@@ -469,6 +565,10 @@ static void display_update(void)
 
     snprintf(line, sizeof(line), "Line %u/2 (2=Stop)", (unsigned)crossing_count);
     OLED_Print(5, 0, line);
+
+    if (turn_active) {
+        OLED_Print(6, 0, ">> CORNER PIVOT <<");
+    }
 
     OLED_Print(7, 0, "UP=Go CENTER=Stop");
 }
